@@ -1,14 +1,12 @@
 name: CI
 
-# Gated on workflow_dispatch until amc v0.5.0 ships. Flip back to
-# push/pull_request triggers once the matrix has a tag to download.
 on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
-  # push:
-  #   branches: [main]
-  #   tags: ['v*']
-  # pull_request:
-  #   branches: [main]
 
 jobs:
   test:
