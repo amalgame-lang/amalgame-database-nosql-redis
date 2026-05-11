@@ -1,0 +1,123 @@
+name: Update packages-index
+
+# On every `v*` tag push, automatically open a PR on
+# amalgame-lang/packages-index registering this version (and its
+# `required-amalgame` constraint). The PR is the SoT for the
+# review — amalgame-lang/packages-index keeps PR-required on main,
+# so the maintainer merges in one click after a glance.
+#
+# Setup:
+#   1. Owner creates a fine-grained PAT scoped to
+#      amalgame-lang/packages-index with Contents + PRs = write.
+#   2. Adds it as a repo secret named `PACKAGES_INDEX_PAT` here.
+#   3. Done — every future `git push origin vX.Y.Z` opens the PR.
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  index-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout package at tag
+        uses: actions/checkout@v4
+
+      - name: Extract manifest fields
+        id: manifest
+        run: |
+          set -e
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ ! -f amalgame.toml ]; then
+            echo "ERROR: no amalgame.toml at the tag root" >&2
+            exit 1
+          fi
+          # Quick-n-dirty extractors — packages own their format and
+          # we control it across the lang-org, so the field-order
+          # assumption (key on its own line, `= "..."` form) holds.
+          NAME=$(grep -E '^name[[:space:]]*=' amalgame.toml | head -1 | sed 's/.*= *"\([^"]*\)".*/\1/')
+          REQ=$(grep -E '^required-amalgame[[:space:]]*=' amalgame.toml | head -1 | sed 's/.*= *"\([^"]*\)".*/\1/')
+          if [ -z "$NAME" ]; then
+            echo "ERROR: could not parse [package].name" >&2
+            exit 1
+          fi
+          if [ -z "$REQ" ]; then
+            echo "WARNING: [package].required-amalgame is empty — entry will let any amc install." >&2
+          fi
+          # Map repo slug → index shortname. New packages: add a
+          # row in this case statement (or fall through to using the
+          # raw slug, which works fine for community packages).
+          case "$NAME" in
+            amalgame-database-duckdb)        SHORT="duckdb" ;;
+            amalgame-database-sqlite)        SHORT="sqlite" ;;
+            amalgame-database-nosql-redis)   SHORT="redis"  ;;
+            amalgame-messaging-mqtt)         SHORT="mqtt"   ;;
+            *) SHORT="$NAME" ;;
+          esac
+          {
+            echo "tag=$TAG"
+            echo "req=$REQ"
+            echo "short=$SHORT"
+            echo "name=$NAME"
+          } >> "$GITHUB_OUTPUT"
+          echo "Registering: $SHORT @ $TAG (needs amc ${REQ:-any})"
+
+      - name: Open PR on packages-index
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_INDEX_PAT }}
+          TAG:   ${{ steps.manifest.outputs.tag }}
+          REQ:   ${{ steps.manifest.outputs.req }}
+          SHORT: ${{ steps.manifest.outputs.short }}
+          NAME:  ${{ steps.manifest.outputs.name }}
+        run: |
+          set -e
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: PACKAGES_INDEX_PAT secret is missing." >&2
+            echo "       See README of amalgame-lang/Amalgame for setup." >&2
+            exit 1
+          fi
+          # Clone via the PAT — auth in the URL is fine here because
+          # we never push the cloned dir back to this package repo;
+          # the URL is local-only for the lifetime of this job.
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/amalgame-lang/packages-index.git" idx
+          cd idx
+          # Idempotency check: skip if this (shortname, tag) pair is
+          # already in packages.toml. `-B2` catches the package= line
+          # within the same [[version]] block (bot emits canonical
+          # order: package → tag → required-amalgame).
+          if grep -B2 "^tag *= *\"${TAG}\"" packages.toml 2>/dev/null | grep -q "^package *= *\"${SHORT}\""; then
+              echo "Already indexed: ${SHORT}@${TAG}. Nothing to do."
+              exit 0
+          fi
+          BR="auto/index-${SHORT}-${TAG}"
+          git checkout -b "$BR"
+          # Append the version block. Two leading newlines so the
+          # file stays readable after multiple appends.
+          cat >> packages.toml <<EOF
+
+          [[version]]
+          package           = "${SHORT}"
+          tag               = "${TAG}"
+          required-amalgame = "${REQ}"
+          EOF
+          git config user.name  "amalgame-index-bot"
+          git config user.email "amalgame-index-bot@users.noreply.github.com"
+          git add packages.toml
+          git commit -m "auto: register ${SHORT}@${TAG} (needs amc ${REQ:-any})"
+          git push origin "$BR"
+          gh pr create \
+            --repo amalgame-lang/packages-index \
+            --base main \
+            --head "$BR" \
+            --title "auto: register ${SHORT}@${TAG}" \
+            --body "Auto-opened by [\`${GITHUB_REPOSITORY}@${TAG}\`](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}).
+
+Adds a new \`[[version]]\` block for **${NAME}** at **${TAG}**, declaring \`required-amalgame = \"${REQ}\"\`.
+
+Review checklist:
+- Tag actually exists on the source repo
+- \`required-amalgame\` looks sane (no breaking jump unless intentional)
+- Source repo's CI on this tag is green
+
+Merge to publish."
