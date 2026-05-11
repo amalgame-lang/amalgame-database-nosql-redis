@@ -62,7 +62,7 @@ static inline code_string _amredis_err_dup(const char* msg) {
 /* Open a TCP connection to redis://host:port. Returns a non-NULL
  * handle even on failure — call Redis.IsOpen() to check, or
  * Redis.LastError() for the message. */
-static inline AmalgameRedis* Redis_Open(code_string host, i64 port) {
+static inline AmalgameRedis* Amalgame_Database_NoSQL_Redis_Open(code_string host, i64 port) {
     _amnet_init_once();
     AmalgameRedis* r = (AmalgameRedis*) code_alloc(sizeof(AmalgameRedis));
     r->fd         = -1;
@@ -105,18 +105,18 @@ static inline AmalgameRedis* Redis_Open(code_string host, i64 port) {
 
 /* Close the socket. Idempotent. The wrapper struct itself is
  * GC-managed; we don't free it here. */
-static inline void Redis_Close(AmalgameRedis* r) {
+static inline void Amalgame_Database_NoSQL_Redis_Close(AmalgameRedis* r) {
     if (r && r->fd >= 0) {
         _amnet_close_socket(r->fd);
         r->fd = -1;
     }
 }
 
-static inline code_bool Redis_IsOpen(AmalgameRedis* r) {
+static inline code_bool Amalgame_Database_NoSQL_Redis_IsOpen(AmalgameRedis* r) {
     return (r && r->fd >= 0) ? 1 : 0;
 }
 
-static inline code_string Redis_LastError(AmalgameRedis* r) {
+static inline code_string Amalgame_Database_NoSQL_Redis_LastError(AmalgameRedis* r) {
     if (!r) return "";
     return r->last_error ? r->last_error : "";
 }
@@ -293,14 +293,14 @@ static inline code_bool _amredis_exec_simple(AmalgameRedis* r, int argc, const c
 /* ── Commands ───────────────────────────────────────── */
 
 /* PING → +PONG. Cheap connection liveness probe. */
-static inline code_bool Redis_Ping(AmalgameRedis* r) {
+static inline code_bool Amalgame_Database_NoSQL_Redis_Ping(AmalgameRedis* r) {
     const char* args[1] = { "PING" };
     return _amredis_exec_simple(r, 1, args);
 }
 
 /* SET key value → +OK. Overwrites any existing value, ignores TTL.
  * Use Redis.Expire(key, seconds) afterwards to apply a TTL. */
-static inline code_bool Redis_Set(AmalgameRedis* r, code_string key, code_string value) {
+static inline code_bool Amalgame_Database_NoSQL_Redis_Set(AmalgameRedis* r, code_string key, code_string value) {
     const char* args[3];
     args[0] = "SET";
     args[1] = key   ? key   : "";
@@ -312,7 +312,7 @@ static inline code_bool Redis_Set(AmalgameRedis* r, code_string key, code_string
  * Returns the value, or "" both when the key is missing and on
  * error. Use Redis.Exists(key) to disambiguate, or check
  * Redis.LastError() on the latter. */
-static inline code_string Redis_Get(AmalgameRedis* r, code_string key) {
+static inline code_string Amalgame_Database_NoSQL_Redis_Get(AmalgameRedis* r, code_string key) {
     if (!r || r->fd < 0) return "";
     const char* args[2];
     args[0] = "GET";
@@ -334,7 +334,7 @@ static inline code_string Redis_Get(AmalgameRedis* r, code_string key) {
 
 /* DEL key → :<count>. Number of keys actually removed (0 or 1 for
  * a single-key DEL). */
-static inline i64 Redis_Del(AmalgameRedis* r, code_string key) {
+static inline i64 Amalgame_Database_NoSQL_Redis_Del(AmalgameRedis* r, code_string key) {
     if (!r || r->fd < 0) return 0;
     const char* args[2];
     args[0] = "DEL";
@@ -355,7 +355,7 @@ static inline i64 Redis_Del(AmalgameRedis* r, code_string key) {
 }
 
 /* EXISTS key → :1 if present, :0 otherwise. */
-static inline code_bool Redis_Exists(AmalgameRedis* r, code_string key) {
+static inline code_bool Amalgame_Database_NoSQL_Redis_Exists(AmalgameRedis* r, code_string key) {
     if (!r || r->fd < 0) return 0;
     const char* args[2];
     args[0] = "EXISTS";
@@ -377,7 +377,7 @@ static inline code_bool Redis_Exists(AmalgameRedis* r, code_string key) {
 
 /* INCR key → :<new value>. Creates the key with value 1 if it
  * didn't exist; errors against a non-integer value. */
-static inline i64 Redis_Incr(AmalgameRedis* r, code_string key) {
+static inline i64 Amalgame_Database_NoSQL_Redis_Incr(AmalgameRedis* r, code_string key) {
     if (!r || r->fd < 0) return 0;
     const char* args[2];
     args[0] = "INCR";
@@ -397,8 +397,8 @@ static inline i64 Redis_Incr(AmalgameRedis* r, code_string key) {
     return 0;
 }
 
-/* DECR key → :<new value>. Mirror of Redis_Incr. */
-static inline i64 Redis_Decr(AmalgameRedis* r, code_string key) {
+/* DECR key → :<new value>. Mirror of Amalgame_Database_NoSQL_Redis_Incr. */
+static inline i64 Amalgame_Database_NoSQL_Redis_Decr(AmalgameRedis* r, code_string key) {
     if (!r || r->fd < 0) return 0;
     const char* args[2];
     args[0] = "DECR";
@@ -420,7 +420,7 @@ static inline i64 Redis_Decr(AmalgameRedis* r, code_string key) {
 
 /* EXPIRE key seconds → :1 on success (TTL set), :0 if the key
  * doesn't exist. Use PEXPIRE for millisecond resolution (v2). */
-static inline code_bool Redis_Expire(AmalgameRedis* r, code_string key, i64 seconds) {
+static inline code_bool Amalgame_Database_NoSQL_Redis_Expire(AmalgameRedis* r, code_string key, i64 seconds) {
     char secStr[32];
     snprintf(secStr, sizeof(secStr), "%lld", (long long) seconds);
     const char* args[3];
