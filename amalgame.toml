@@ -1,0 +1,36 @@
+# Package manifest — amc reads this at `amc add` time. See
+# docs/proposals/amalgame-package-manager.md in
+# amalgame-lang/Amalgame for the full spec.
+
+[package]
+name              = "amalgame-database-nosql-redis"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Redis (RESP2) client for Amalgame — pure-protocol over raw TCP, no vendored lib."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.5.0"
+
+[stdlib]
+class     = "Redis"
+header    = "runtime/Amalgame_Database_Redis.h"
+namespace = "Amalgame.Database.NoSQL.Redis"
+
+# No vendored .c sources — RESP2 is implemented entirely in the
+# header. The user binary picks up the cross-platform socket
+# layer from Amalgame_Net.h (always available with amc).
+[stdlib.functions]
+Open      = { returns = "AmalgameRedis*" }
+Close     = { returns = "void" }
+IsOpen    = { returns = "code_bool" }
+LastError = { returns = "code_string" }
+Ping      = { returns = "code_bool" }
+Set       = { returns = "code_bool" }
+Get       = { returns = "code_string" }
+Del       = { returns = "i64" }
+Exists    = { returns = "code_bool" }
+Incr      = { returns = "i64" }
+Decr      = { returns = "i64" }
+Expire    = { returns = "code_bool" }
+
+[dependencies]
+# none — Redis is a leaf in the dep graph
