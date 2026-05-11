@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        amc-tag: [v0.5.0]
+        amc-tag: [v0.6.0, v0.5.0]
     steps:
       - uses: actions/checkout@v4
 
