@@ -71,7 +71,7 @@ echo ""
 
 # ── Install self via amc add ──────────────────────────
 PKG_GIT_URL="github.com/amalgame-lang/amalgame-database-nosql-redis"
-PKG_TAG="${PKG_TAG:-v0.1.0}"
+PKG_TAG="${PKG_TAG:-v0.2.0}"
 if [ "$REDIS_AVAILABLE" = "1" ]; then
     echo "── Resolving $PKG_GIT_URL@$PKG_TAG ──"
     if ! (cd "$PROJ_DIR" && "$AMC" add "$PKG_GIT_URL@$PKG_TAG") > "$BUILD_DIR/install.log" 2>&1; then
