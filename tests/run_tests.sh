@@ -69,22 +69,34 @@ else
 fi
 echo ""
 
-# ── Install self via amc add ──────────────────────────
-PKG_GIT_URL="github.com/amalgame-lang/amalgame-database-nosql-redis"
+# ── Stage a fake cache pointing at the local working tree ──
+# Without this, the test .am file's `import Amalgame.Database.NoSQL.Redis`
+# fails because amc has no way to know about the package. `amc
+# package add` needs a published tag, which this CI doesn't have
+# until release time. So we manually craft the cache layout amc
+# expects + a project amalgame.lock pointing into it.
+FAKE_CACHE="$BUILD_DIR/cache"
+PKG_GIT="github.com/amalgame-lang/amalgame-database-nosql-redis"
 PKG_TAG="${PKG_TAG:-v0.2.0}"
-if [ "$REDIS_AVAILABLE" = "1" ]; then
-    echo "── Resolving $PKG_GIT_URL@$PKG_TAG ──"
-    if ! (cd "$PROJ_DIR" && "$AMC" add "$PKG_GIT_URL@$PKG_TAG") > "$BUILD_DIR/install.log" 2>&1; then
-        echo "  amc add failed — falling back to the local working tree."
-        # Write a stub lock pointing at a non-existent commit, but
-        # since the test file imports the namespace and uses the
-        # Redis class directly, we need amc to know about it. The
-        # easiest fallback is to compile manually with the local
-        # header (skip the lockfile path).
-        REDIS_AVAILABLE=0
-    fi
-    echo ""
-fi
+FAKE_SHA="deadbeefcafebabe0000000000000000000000ab"
+SHORT_SHA="${FAKE_SHA:0:8}"
+PKG_CACHE_DIR="$FAKE_CACHE/$PKG_GIT/${PKG_TAG}_${SHORT_SHA}"
+
+mkdir -p "$(dirname "$PKG_CACHE_DIR")"
+rm -rf "$PKG_CACHE_DIR"
+ln -s "$PKG_ROOT" "$PKG_CACHE_DIR"
+
+cat > "$PROJ_DIR/amalgame.lock" <<EOF
+[[package]]
+name = "amalgame-database-nosql-redis"
+git  = "$PKG_GIT"
+tag  = "$PKG_TAG"
+rev  = "$FAKE_SHA"
+EOF
+
+export AMALGAME_PACKAGES_DIR="$FAKE_CACHE"
+echo "  cache:   $FAKE_CACHE → $PKG_ROOT"
+echo ""
 
 # ── Helper ─────────────────────────────────────────────
 run_test() {
