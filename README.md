@@ -51,10 +51,61 @@ Redis.Close(r)
 | `Redis.Decr(r, key)` | `int` | Mirror of Incr |
 | `Redis.Expire(r, key, sec)` | `bool` | TTL in seconds |
 
-## Deferred to v2
+### v0.3.0 additions — Pub/Sub + Pipelining
 
-AUTH, SELECT db, pipelining, pub/sub, MULTI/EXEC transactions, SCAN
-array replies, TLS, binary-safe values with embedded NULs.
+**Pub/Sub** — `Subscribe` moves the handle into subscriber mode; the connection no longer accepts ordinary commands until every channel has been unsubscribed. Open a second handle for publishing in real apps.
+
+| Method | Returns | Notes |
+|---|---|---|
+| `Redis.Publish(r, channel, msg)` | `int` | Subscriber count, -1 on error |
+| `Redis.Subscribe(r, channel)` | `bool` | Enters subscriber mode |
+| `Redis.Unsubscribe(r, channel)` | `bool` | Leaves subscriber mode when 0 channels remain |
+| `Redis.WaitMessage(r, timeoutMs)` | `bool` | True when a MSG arrived; sets last channel + last message |
+| `Redis.LastChannel(r)` | `string` | Channel from most recent WaitMessage hit |
+| `Redis.LastMessage(r)` | `string` | Payload from most recent WaitMessage hit |
+
+**Pipelining** — queue many commands client-side, flush in one write, read every reply back in order. Halves round-trip cost on chains of small commands.
+
+| Method | Returns | Notes |
+|---|---|---|
+| `Redis.PipelineBegin(r)` | `void` | Reset the queue, enter pipeline mode |
+| `Redis.PipelineSet(r, k, v)` | `void` | Queue SET |
+| `Redis.PipelineGet(r, k)` | `void` | Queue GET |
+| `Redis.PipelineIncr(r, k)` | `void` | Queue INCR |
+| `Redis.PipelineDecr(r, k)` | `void` | Queue DECR |
+| `Redis.PipelineDel(r, k)` | `void` | Queue DEL |
+| `Redis.PipelineExpire(r, k, sec)` | `void` | Queue EXPIRE |
+| `Redis.PipelineExec(r)` | `int` | Flush + read; returns reply count |
+| `Redis.PipelineResponseAt(r, idx)` | `string` | Reply at queue position idx |
+
+```amalgame
+let r = Redis.Open("127.0.0.1", 6379)
+
+// Pipeline 3 SETs + 1 INCR in one round-trip.
+Redis.PipelineBegin(r)
+Redis.PipelineSet(r, "user:1", "alice")
+Redis.PipelineSet(r, "user:2", "bob")
+Redis.PipelineSet(r, "user:3", "carol")
+Redis.PipelineIncr(r, "user:count")
+let n = Redis.PipelineExec(r)
+Console.WriteLine("user count: " + Redis.PipelineResponseAt(r, 3))  // "3"
+
+// Pub/Sub on a fresh connection.
+let sub = Redis.Open("127.0.0.1", 6379)
+Redis.Subscribe(sub, "events")
+Redis.Publish(r, "events", "hello")
+if (Redis.WaitMessage(sub, 1000)) {
+    Console.WriteLine(Redis.LastChannel(sub) + " → " + Redis.LastMessage(sub))
+}
+Redis.Unsubscribe(sub, "events")
+Redis.Close(sub); Redis.Close(r)
+```
+
+## Deferred to v0.4+
+
+AUTH, SELECT db, MULTI/EXEC transactions, SCAN array replies, TLS,
+binary-safe values with embedded NULs, PSUBSCRIBE pattern matching,
+hash / list / set / sorted-set surface.
 
 ## Threading
 

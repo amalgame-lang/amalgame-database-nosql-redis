@@ -132,6 +132,101 @@ public class Program {
         // Cleanup the counter key (already has TTL but be explicit).
         Redis.Del(r, "amctest:counter")
 
+        // ═══════════════════════════════════════════════════════
+        //  v0.3 — Pipelining
+        // ═══════════════════════════════════════════════════════
+        //
+        // Queue 5 commands, flush once, assert each reply lands at
+        // the expected position. Cheap halving of round-trip cost
+        // for chains of small commands — half the value of a Redis
+        // client at all is paying for the network only once.
+
+        Redis.PipelineBegin(r)
+        Redis.PipelineSet(r, "amctest:p1", "alpha")
+        Redis.PipelineSet(r, "amctest:p2", "beta")
+        Redis.PipelineGet(r, "amctest:p1")
+        Redis.PipelineIncr(r, "amctest:pcounter")
+        Redis.PipelineDel(r, "amctest:p1")
+        let nResp: int = Redis.PipelineExec(r)
+        if (nResp == 5) {
+            Console.WriteLine("[PASS] pipeline 5 replies")
+        } else {
+            Console.WriteLine("[FAIL] pipeline got " + String_FromInt(nResp))
+        }
+
+        let p0: string = Redis.PipelineResponseAt(r, 0)
+        let p1: string = Redis.PipelineResponseAt(r, 1)
+        let p2: string = Redis.PipelineResponseAt(r, 2)
+        let p3: string = Redis.PipelineResponseAt(r, 3)
+        let p4: string = Redis.PipelineResponseAt(r, 4)
+        if (p0 == "OK" && p1 == "OK"
+            && p2 == "alpha"
+            && p3 == "1"
+            && p4 == "1") {
+            Console.WriteLine("[PASS] pipeline responses in order")
+        } else {
+            Console.WriteLine("[FAIL] pipeline: ["
+                + p0 + "|" + p1 + "|" + p2 + "|" + p3 + "|" + p4 + "]")
+        }
+
+        // Cleanup the pipeline keys.
+        Redis.Del(r, "amctest:p2")
+        Redis.Del(r, "amctest:pcounter")
+
+        // ═══════════════════════════════════════════════════════
+        //  v0.3 — Pub/Sub
+        // ═══════════════════════════════════════════════════════
+        //
+        // PUBLISH from a normal connection (`r` is in normal mode
+        // here); SUBSCRIBE moves a second handle into subscriber
+        // mode then WaitMessage blocks for the next push.
+        //
+        // We open a second connection `s` for the subscriber so the
+        // publisher stays usable for normal commands. Real apps do
+        // this routinely — pub/sub mode forbids most regular
+        // commands on the same connection.
+
+        let s = Redis.Open("127.0.0.1", 6379)
+        if (Redis.IsOpen(s)) {
+            Console.WriteLine("[PASS] open subscriber")
+        } else {
+            Console.WriteLine("[FAIL] open subscriber: " + Redis.LastError(s))
+            Redis.Close(r)
+            return
+        }
+
+        let subOk: bool = Redis.Subscribe(s, "amctest:bus")
+        if (subOk) {
+            Console.WriteLine("[PASS] subscribe amctest:bus")
+        } else {
+            Console.WriteLine("[FAIL] subscribe: " + Redis.LastError(s))
+        }
+
+        // Publish from r; expect 1 subscriber acknowledged.
+        let nSubs: int = Redis.Publish(r, "amctest:bus", "ping")
+        if (nSubs >= 1) {
+            Console.WriteLine("[PASS] publish reaches >=1 subscriber")
+        } else {
+            Console.WriteLine("[FAIL] publish got " + String_FromInt(nSubs))
+        }
+
+        // Receive via WaitMessage (1s budget).
+        let got1: bool = Redis.WaitMessage(s, 1000)
+        if (got1) {
+            let ch: string = Redis.LastChannel(s)
+            let msg: string = Redis.LastMessage(s)
+            if (ch == "amctest:bus" && msg == "ping") {
+                Console.WriteLine("[PASS] WaitMessage returns channel + payload")
+            } else {
+                Console.WriteLine("[FAIL] got ch='" + ch + "' msg='" + msg + "'")
+            }
+        } else {
+            Console.WriteLine("[FAIL] WaitMessage timed out")
+        }
+
+        Redis.Unsubscribe(s, "amctest:bus")
+        Redis.Close(s)
+
         // ── Close ─────────────────────────────────────────
 
         Redis.Close(r)

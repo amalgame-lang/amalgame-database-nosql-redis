@@ -46,6 +46,27 @@
 typedef struct AmalgameRedis {
     int         fd;          /* socket fd; -1 = not connected */
     char*       last_error;  /* GC-strdup'd error message, or NULL */
+
+    /* ── Pub/Sub state (v0.3) ────────────────────────── */
+    /* Once Subscribe is called, the connection enters subscriber
+     * mode — the server pushes MSG arrays unsolicited. WaitMessage
+     * blocks for the next one and stashes its channel + payload
+     * here so the AM side can read them via dedicated verbs. */
+    char*       last_channel;
+    char*       last_message;
+    int         in_subscriber_mode;
+
+    /* ── Pipeline state (v0.3) ───────────────────────── */
+    /* PipelineBegin sets `in_pipeline=1` and resets the buffer;
+     * subsequent Pipeline* commands append wire bytes WITHOUT
+     * reading the reply. PipelineExec flushes the buffer and
+     * reads exactly `pipeline_count` replies in order. */
+    char*       pipeline_buf;
+    size_t      pipeline_buf_n;
+    size_t      pipeline_buf_cap;
+    int         pipeline_count;
+    int         in_pipeline;
+    AmalgameList* pipeline_responses;   /* List<string>, set by Exec */
 } AmalgameRedis;
 
 /* GC-dup an error message into a stable buffer. */
@@ -67,6 +88,15 @@ static inline AmalgameRedis* Amalgame_Database_NoSQL_Redis_Open(code_string host
     AmalgameRedis* r = (AmalgameRedis*) code_alloc(sizeof(AmalgameRedis));
     r->fd         = -1;
     r->last_error = NULL;
+    r->last_channel        = NULL;
+    r->last_message        = NULL;
+    r->in_subscriber_mode  = 0;
+    r->pipeline_buf        = NULL;
+    r->pipeline_buf_n      = 0;
+    r->pipeline_buf_cap    = 0;
+    r->pipeline_count      = 0;
+    r->in_pipeline         = 0;
+    r->pipeline_responses  = NULL;
 
     if (!host || !*host) {
         r->last_error = _amredis_err_dup("host is empty");
@@ -428,6 +458,351 @@ static inline code_bool Amalgame_Database_NoSQL_Redis_Expire(AmalgameRedis* r, c
     args[1] = key ? key : "";
     args[2] = secStr;
     return _amredis_exec_simple(r, 3, args);
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  v0.3 — Pub/Sub + Pipelining
+ * ═══════════════════════════════════════════════════════
+ *
+ * Pub/Sub: PUBLISH is fire-and-forget (returns subscriber count).
+ * SUBSCRIBE moves the connection into subscriber mode: the server
+ * pushes MSG arrays unsolicited. WaitMessage blocks for the next
+ * one and stashes channel + payload on the handle.
+ *
+ *   *3\r\n
+ *   $7\r\nmessage\r\n            ← "message" / "subscribe" / "unsubscribe"
+ *   $<chan-len>\r\n<chan>\r\n
+ *   $<msg-len>\r\n<msg>\r\n
+ *
+ * Pipelining batches commands client-side: PipelineBegin → many
+ * Pipeline* → PipelineExec. The wire writes are buffered and only
+ * sent in one chunk at Exec, halving round-trip cost on chains of
+ * small commands. Responses are returned in order via
+ * PipelineResponseAt(idx).
+ */
+
+/* ── RESP array reply parser — needed for pub/sub MSG ─── */
+
+/* Read a single RESP-2 element (bulk string, integer, simple
+ * string, or error) and return its payload as a GC-alloc'd C
+ * string. Integers and arrays are stringified. Returns NULL on
+ * EOF / socket error. */
+static inline char* _amredis_read_one_element(int fd) {
+    char prefix;
+    ssize_t k = recv(fd, &prefix, 1, 0);
+    if (k <= 0) return NULL;
+    char* line = _amredis_read_line(fd);
+    if (!line) return NULL;
+    if (prefix == '+' || prefix == '-') {
+        return line;
+    }
+    if (prefix == ':') {
+        /* Stringify the integer so the pipeline-response list can
+         * hold a uniform List<string>. */
+        char tmp[32];
+        snprintf(tmp, sizeof(tmp), "%lld", (long long) atoll(line));
+        size_t n = strlen(tmp);
+        char* p = (char*) code_alloc(n + 1);
+        memcpy(p, tmp, n + 1);
+        return p;
+    }
+    if (prefix == '$') {
+        long long len = atoll(line);
+        if (len < 0) {
+            /* nil bulk — represent as empty string in the response list. */
+            char* p = (char*) code_alloc(1);
+            p[0] = '\0';
+            return p;
+        }
+        return _amredis_read_bulk(fd, (size_t) len);
+    }
+    /* Arrays inside an element — not used by the v0.3 surface. */
+    return NULL;
+}
+
+/* Read a multi-bulk array reply. `expected_len` is filled with the
+ * declared element count; `out_elements` is a GC-alloc'd array of
+ * GC-alloc'd C strings of length expected_len. Returns 0/-1. */
+static inline int _amredis_read_array(int fd, long long* expected_len, char*** out_elements) {
+    char prefix;
+    ssize_t k = recv(fd, &prefix, 1, 0);
+    if (k <= 0) return -1;
+    if (prefix != '*') return -1;
+    char* line = _amredis_read_line(fd);
+    if (!line) return -1;
+    long long n = atoll(line);
+    if (n < 0) { *expected_len = 0; *out_elements = NULL; return 0; }
+    char** arr = (char**) code_alloc((size_t) n * sizeof(char*));
+    for (long long i = 0; i < n; i++) {
+        arr[i] = _amredis_read_one_element(fd);
+        if (!arr[i]) return -1;
+    }
+    *expected_len = n;
+    *out_elements = arr;
+    return 0;
+}
+
+/* ── Pub/Sub ────────────────────────────────────────── */
+
+/* PUBLISH channel message → :N (subscriber count). Returns -1 on
+ * error (LastError set), N ≥ 0 on success. Can be called even on
+ * a normal (non-subscriber) connection. */
+static inline i64 Amalgame_Database_NoSQL_Redis_Publish(
+        AmalgameRedis* r, code_string channel, code_string message) {
+    if (!r || r->fd < 0) return -1;
+    const char* args[3];
+    args[0] = "PUBLISH";
+    args[1] = channel ? channel : "";
+    args[2] = message ? message : "";
+    size_t cmd_n = 0;
+    char* cmd = _amredis_build_cmd(3, args, &cmd_n);
+    if (_amredis_send_all(r->fd, cmd, cmd_n) < 0) {
+        r->last_error = _amredis_err_dup("Publish: send failed");
+        return -1;
+    }
+    _AmRedisReply rep = _amredis_read_reply(r->fd);
+    if (rep.kind == ':') return rep.int_val;
+    r->last_error = _amredis_err_dup(
+        rep.str_val && *rep.str_val ? rep.str_val : "PUBLISH unexpected reply");
+    return -1;
+}
+
+/* SUBSCRIBE channel → *3 [subscribe, channel, sub-count]. Moves
+ * the connection into subscriber mode. Successive Subscribe calls
+ * stack channels on the same connection. */
+static inline code_bool Amalgame_Database_NoSQL_Redis_Subscribe(
+        AmalgameRedis* r, code_string channel) {
+    if (!r || r->fd < 0 || !channel) return 0;
+    const char* args[2];
+    args[0] = "SUBSCRIBE";
+    args[1] = channel;
+    size_t cmd_n = 0;
+    char* cmd = _amredis_build_cmd(2, args, &cmd_n);
+    if (_amredis_send_all(r->fd, cmd, cmd_n) < 0) {
+        r->last_error = _amredis_err_dup("Subscribe: send failed");
+        return 0;
+    }
+    long long n = 0;
+    char** elems = NULL;
+    if (_amredis_read_array(r->fd, &n, &elems) != 0 || n < 3) {
+        r->last_error = _amredis_err_dup("Subscribe: bad confirmation");
+        return 0;
+    }
+    /* Expect elems[0] = "subscribe", elems[1] = channel,
+     * elems[2] = stringified subscriber count. */
+    if (strcmp(elems[0], "subscribe") != 0) {
+        r->last_error = _amredis_err_dup(elems[0] ? elems[0] : "non-subscribe reply");
+        return 0;
+    }
+    r->in_subscriber_mode = 1;
+    return 1;
+}
+
+/* UNSUBSCRIBE channel → *3 [unsubscribe, channel, remaining]. */
+static inline code_bool Amalgame_Database_NoSQL_Redis_Unsubscribe(
+        AmalgameRedis* r, code_string channel) {
+    if (!r || r->fd < 0 || !channel) return 0;
+    const char* args[2];
+    args[0] = "UNSUBSCRIBE";
+    args[1] = channel;
+    size_t cmd_n = 0;
+    char* cmd = _amredis_build_cmd(2, args, &cmd_n);
+    if (_amredis_send_all(r->fd, cmd, cmd_n) < 0) {
+        r->last_error = _amredis_err_dup("Unsubscribe: send failed");
+        return 0;
+    }
+    long long n = 0;
+    char** elems = NULL;
+    if (_amredis_read_array(r->fd, &n, &elems) != 0 || n < 3) {
+        r->last_error = _amredis_err_dup("Unsubscribe: bad confirmation");
+        return 0;
+    }
+    /* Server returns "unsubscribe" + the per-call remaining count
+     * (== 0 once we've dropped every channel). */
+    if (strcmp(elems[0], "unsubscribe") != 0) {
+        r->last_error = _amredis_err_dup(elems[0] ? elems[0] : "non-unsubscribe reply");
+        return 0;
+    }
+    /* Stay in subscriber mode if we still hold other subscriptions;
+     * the remaining count is in elems[2]. */
+    long long remaining = atoll(elems[2] ? elems[2] : "0");
+    if (remaining == 0) r->in_subscriber_mode = 0;
+    return 1;
+}
+
+/* Block until the next pushed MSG arrives, then stash channel +
+ * payload on the handle. timeout_ms is applied to the socket
+ * receive — 0 means block forever. Returns 1 on a message, 0 on
+ * timeout, -ish on error (LastError set). */
+static inline code_bool Amalgame_Database_NoSQL_Redis_WaitMessage(
+        AmalgameRedis* r, i64 timeout_ms) {
+    if (!r || r->fd < 0) return 0;
+    if (!r->in_subscriber_mode) {
+        r->last_error = _amredis_err_dup("WaitMessage: not subscribed");
+        return 0;
+    }
+    /* Apply receive timeout. */
+#ifdef _WIN32
+    DWORD tv = (timeout_ms > 0) ? (DWORD) timeout_ms : 0;
+    setsockopt(r->fd, SOL_SOCKET, SO_RCVTIMEO, (const char*) &tv, sizeof(tv));
+#else
+    struct timeval tv;
+    if (timeout_ms > 0) {
+        tv.tv_sec  = (time_t) (timeout_ms / 1000);
+        tv.tv_usec = (suseconds_t) ((timeout_ms % 1000) * 1000);
+    } else {
+        tv.tv_sec = 0; tv.tv_usec = 0;
+    }
+    setsockopt(r->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+    long long n = 0;
+    char** elems = NULL;
+    if (_amredis_read_array(r->fd, &n, &elems) != 0 || n < 3) {
+        /* Timeout shows up as recv() returning 0 / -1; treat both
+         * as "no message" rather than a hard error. */
+        return 0;
+    }
+    /* Expect *3 [message, channel, payload]. */
+    if (strcmp(elems[0], "message") != 0) {
+        /* Could be a "subscribe" / "unsubscribe" confirmation that
+         * leaked through — ignore and report no msg this tick. */
+        return 0;
+    }
+    r->last_channel = elems[1];
+    r->last_message = elems[2];
+    return 1;
+}
+
+static inline code_string Amalgame_Database_NoSQL_Redis_LastChannel(AmalgameRedis* r) {
+    if (!r || !r->last_channel) return (code_string) "";
+    return (code_string) r->last_channel;
+}
+
+static inline code_string Amalgame_Database_NoSQL_Redis_LastMessage(AmalgameRedis* r) {
+    if (!r || !r->last_message) return (code_string) "";
+    return (code_string) r->last_message;
+}
+
+/* ── Pipelining ────────────────────────────────────── */
+
+/* Append `n` bytes to the pipeline_buf, growing if needed. */
+static inline void _amredis_pipeline_append(AmalgameRedis* r, const char* bytes, size_t n) {
+    size_t need = r->pipeline_buf_n + n;
+    if (need > r->pipeline_buf_cap) {
+        size_t newcap = r->pipeline_buf_cap ? r->pipeline_buf_cap : 256;
+        while (newcap < need) newcap *= 2;
+        char* p = (char*) code_alloc(newcap);
+        if (r->pipeline_buf_n > 0) memcpy(p, r->pipeline_buf, r->pipeline_buf_n);
+        r->pipeline_buf = p;
+        r->pipeline_buf_cap = newcap;
+    }
+    memcpy(r->pipeline_buf + r->pipeline_buf_n, bytes, n);
+    r->pipeline_buf_n += n;
+}
+
+/* Encode a command into RESP and append it to the pipeline buf.
+ * Bumps the queued-command counter. */
+static inline void _amredis_pipeline_queue(
+        AmalgameRedis* r, int argc, const char* const* args) {
+    size_t cmd_n = 0;
+    char* cmd = _amredis_build_cmd(argc, args, &cmd_n);
+    if (!cmd) return;
+    _amredis_pipeline_append(r, cmd, cmd_n);
+    r->pipeline_count++;
+}
+
+/* Enter pipeline mode: clear the buffer and the counter. */
+static inline void Amalgame_Database_NoSQL_Redis_PipelineBegin(AmalgameRedis* r) {
+    if (!r) return;
+    r->in_pipeline       = 1;
+    r->pipeline_buf      = NULL;
+    r->pipeline_buf_n    = 0;
+    r->pipeline_buf_cap  = 0;
+    r->pipeline_count    = 0;
+    r->pipeline_responses = NULL;
+}
+
+static inline void Amalgame_Database_NoSQL_Redis_PipelineSet(
+        AmalgameRedis* r, code_string key, code_string value) {
+    if (!r || !r->in_pipeline) return;
+    const char* args[3] = { "SET", key ? key : "", value ? value : "" };
+    _amredis_pipeline_queue(r, 3, args);
+}
+
+static inline void Amalgame_Database_NoSQL_Redis_PipelineGet(
+        AmalgameRedis* r, code_string key) {
+    if (!r || !r->in_pipeline) return;
+    const char* args[2] = { "GET", key ? key : "" };
+    _amredis_pipeline_queue(r, 2, args);
+}
+
+static inline void Amalgame_Database_NoSQL_Redis_PipelineIncr(
+        AmalgameRedis* r, code_string key) {
+    if (!r || !r->in_pipeline) return;
+    const char* args[2] = { "INCR", key ? key : "" };
+    _amredis_pipeline_queue(r, 2, args);
+}
+
+static inline void Amalgame_Database_NoSQL_Redis_PipelineDecr(
+        AmalgameRedis* r, code_string key) {
+    if (!r || !r->in_pipeline) return;
+    const char* args[2] = { "DECR", key ? key : "" };
+    _amredis_pipeline_queue(r, 2, args);
+}
+
+static inline void Amalgame_Database_NoSQL_Redis_PipelineDel(
+        AmalgameRedis* r, code_string key) {
+    if (!r || !r->in_pipeline) return;
+    const char* args[2] = { "DEL", key ? key : "" };
+    _amredis_pipeline_queue(r, 2, args);
+}
+
+static inline void Amalgame_Database_NoSQL_Redis_PipelineExpire(
+        AmalgameRedis* r, code_string key, i64 seconds) {
+    if (!r || !r->in_pipeline) return;
+    char secStr[24];
+    snprintf(secStr, sizeof(secStr), "%lld", (long long) seconds);
+    const char* args[3] = { "EXPIRE", key ? key : "", secStr };
+    _amredis_pipeline_queue(r, 3, args);
+}
+
+/* Flush the buffered commands in one write, then read exactly
+ * `pipeline_count` replies in order, stringify each, and store
+ * in pipeline_responses. Returns the count of replies read. */
+static inline i64 Amalgame_Database_NoSQL_Redis_PipelineExec(AmalgameRedis* r) {
+    if (!r || !r->in_pipeline || r->fd < 0) return 0;
+    int expected = r->pipeline_count;
+    if (expected == 0) {
+        r->in_pipeline = 0;
+        return 0;
+    }
+    if (_amredis_send_all(r->fd, r->pipeline_buf, r->pipeline_buf_n) < 0) {
+        r->last_error = _amredis_err_dup("PipelineExec: send failed");
+        r->in_pipeline = 0;
+        return 0;
+    }
+    AmalgameList* out = AmalgameList_new();
+    int got = 0;
+    for (int i = 0; i < expected; i++) {
+        char* el = _amredis_read_one_element(r->fd);
+        if (!el) break;
+        AmalgameList_add(out, (void*) el);
+        got++;
+    }
+    r->pipeline_responses = out;
+    r->in_pipeline = 0;
+    /* Don't clear pipeline_buf — it's GC, drops on its own. */
+    return (i64) got;
+}
+
+static inline code_string Amalgame_Database_NoSQL_Redis_PipelineResponseAt(
+        AmalgameRedis* r, i64 idx) {
+    if (!r || !r->pipeline_responses) return (code_string) "";
+    if (idx < 0 || idx >= AmalgameList_count(r->pipeline_responses)) {
+        return (code_string) "";
+    }
+    return (code_string) AmalgameList_get(r->pipeline_responses, idx);
 }
 
 #endif /* AMALGAME_DATABASE_REDIS_H */
