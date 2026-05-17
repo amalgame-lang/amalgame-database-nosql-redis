@@ -77,7 +77,7 @@ echo ""
 # expects + a project amalgame.lock pointing into it.
 FAKE_CACHE="$BUILD_DIR/cache"
 PKG_GIT="github.com/amalgame-lang/amalgame-database-nosql-redis"
-PKG_TAG="${PKG_TAG:-v0.2.0}"
+PKG_TAG="${PKG_TAG:-v0.3.0}"
 FAKE_SHA="deadbeefcafebabe0000000000000000000000ab"
 SHORT_SHA="${FAKE_SHA:0:8}"
 PKG_CACHE_DIR="$FAKE_CACHE/$PKG_GIT/${PKG_TAG}_${SHORT_SHA}"
@@ -155,6 +155,17 @@ run_test "expire 60s"           "[PASS] expire 60s"
 run_test "expire on missing"    "[PASS] expire on missing"
 run_test "del 1"                "[PASS] del 1"
 run_test "gone after del"       "[PASS] gone after del"
+
+# v0.3 — Pipelining
+run_test "pipeline 5 replies"   "[PASS] pipeline 5 replies"
+run_test "pipeline responses"   "[PASS] pipeline responses in order"
+
+# v0.3 — Pub/Sub (second connection for the subscriber)
+run_test "open subscriber"      "[PASS] open subscriber"
+run_test "subscribe amctest:bus" "[PASS] subscribe amctest:bus"
+run_test "publish >=1 subs"     "[PASS] publish reaches >=1 subscriber"
+run_test "WaitMessage chan+msg" "[PASS] WaitMessage returns channel + payload"
+
 run_test "close"                "[PASS] closed"
 
 echo ""

@@ -24,7 +24,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        amc-tag: [v0.6.0, v0.5.0]
+        # v0.8.22 is the floor for the v0.3 Pub/Sub + Pipeline
+        # surface — those verbs landed in the manifest at v0.3.0
+        # and require an amc whose resolver knows the namespace.
+        amc-tag: [v0.8.22]
     steps:
       - uses: actions/checkout@v4
 
@@ -41,11 +44,10 @@ jobs:
           curl -sSL -o amc.tar.gz \
             "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
           mkdir -p $RUNNER_TEMP/amc-install
-          # --strip-components=1 peels the `amc-<ver>-linux-x86_64/`
-          # root dir so $RUNNER_TEMP/amc-install/amc is the binary.
+          # v0.8.22+ tarball layout: bin/amc + share/amalgame/runtime/*.h
           tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
-          echo "AMC=$RUNNER_TEMP/amc-install/amc" >> $GITHUB_ENV
-          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/runtime" >> $GITHUB_ENV
+          echo "AMC=$RUNNER_TEMP/amc-install/bin/amc" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/share/amalgame/runtime" >> $GITHUB_ENV
 
       - name: Run tests
         run: ./tests/run_tests.sh "$AMC"
