@@ -4,9 +4,9 @@
 
 [package]
 name              = "amalgame-database-nosql-redis"
-version           = "0.2.0"
+version           = "0.3.0"
 license           = "Apache-2.0"
-description       = "Redis (RESP2) client for Amalgame — pure-protocol over raw TCP, no vendored lib."
+description       = "Redis (RESP2) client for Amalgame — KV + Pub/Sub + pipelining, pure-protocol over raw TCP, no vendored lib."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.5.0"
 
@@ -31,6 +31,25 @@ Exists    = { returns = "code_bool" }
 Incr      = { returns = "i64" }
 Decr      = { returns = "i64" }
 Expire    = { returns = "code_bool" }
+
+# v0.3 — Pub/Sub
+Publish         = { returns = "i64" }
+Subscribe       = { returns = "code_bool" }
+Unsubscribe     = { returns = "code_bool" }
+WaitMessage     = { returns = "code_bool" }
+LastChannel     = { returns = "code_string" }
+LastMessage     = { returns = "code_string" }
+
+# v0.3 — Pipelining
+PipelineBegin       = { returns = "void" }
+PipelineSet         = { returns = "void" }
+PipelineGet         = { returns = "void" }
+PipelineIncr        = { returns = "void" }
+PipelineDecr        = { returns = "void" }
+PipelineDel         = { returns = "void" }
+PipelineExpire      = { returns = "void" }
+PipelineExec        = { returns = "i64" }
+PipelineResponseAt  = { returns = "code_string" }
 
 [dependencies]
 # none — Redis is a leaf in the dep graph
